@@ -1,3 +1,5 @@
+# Manual promote: alpha pre-release tag -> stable tag + latest release.
+# (workflow_dispatch-only; keep this file on the default branch so Actions indexes it.)
 name: Promote Release
 
 on:
