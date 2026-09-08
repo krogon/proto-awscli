@@ -62,6 +62,10 @@ async function main() {
   const date = new Date().toISOString().slice(0, 10).replace(/-/g, "");
   const version = `${major}.${minor}.${patch}-alpha.${date}.${runNumber}`;
 
+  const out = Deno.env.get("GITHUB_OUTPUT");
+  if (out) {
+    await Deno.writeTextFile(out, `version=${version}\n`, { append: true });
+  }
   console.log(version);
 }
 
