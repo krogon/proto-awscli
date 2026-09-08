@@ -27,7 +27,7 @@ jobs:
           deno-version: v2.x
 
       - id: version
-        run: deno run --allow-run --allow-read --allow-env .github/scripts/release/determine-version.ts
+        run: deno run --allow-run --allow-read --allow-env --allow-write=$GITHUB_OUTPUT .github/scripts/release/determine-version.ts
 
       - if: steps.version.outputs.version != ''
         run: sed -i "s/^version = \".*\"/version = \"${{ steps.version.outputs.version }}\"/" Cargo.toml
