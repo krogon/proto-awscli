@@ -4,18 +4,35 @@ use std::collections::HashMap;
 
 #[host_fn]
 extern "ExtismHost" {
+    fn download_file(input: Json<DownloadFileInput>) -> Json<DownloadFileOutput>;
     fn exec_command(input: Json<ExecCommandInput>) -> Json<ExecCommandOutput>;
-    fn from_virtual_path(path: String) -> String;
 }
 
 static NAME: &str = "AWS CLI";
+
+/// Format a host path for native Windows tools.
+///
+/// Under WASI, `VirtualPath::to_real_path()` keeps `C:\...` prefixes as a single
+/// path component and later joins with `/`, producing mixed separators that
+/// `msiexec` cannot open (Windows Installer error 1619).
+fn windows_host_path(path: &str) -> String {
+    path.replace('\\', "/").replace('/', "\\")
+}
+
+fn windows_join(dir: &str, name: &str) -> String {
+    format!(
+        "{}\\{}",
+        windows_host_path(dir).trim_end_matches('\\'),
+        name
+    )
+}
 
 #[plugin_fn]
 pub fn register_tool(Json(_): Json<RegisterToolInput>) -> FnResult<Json<RegisterToolOutput>> {
     Ok(Json(RegisterToolOutput {
         name: NAME.into(),
         type_of: PluginType::CommandLine,
-        minimum_proto_version: Some(Version::new(0, 46, 0)),
+        minimum_proto_version: Some(Version::new(0, 61, 0)),
         plugin_version: Version::parse(env!("CARGO_PKG_VERSION")).ok(),
         self_upgrade_commands: vec!["upgrade".into()],
         ..RegisterToolOutput::default()
@@ -70,7 +87,7 @@ pub fn download_prebuilt(
 
     check_supported_os_and_arch(
         NAME,
-        &env,
+        env,
         permutations![
             HostOS::Linux => [HostArch::X64, HostArch::Arm64],
             HostOS::MacOS => [HostArch::X64, HostArch::Arm64],
@@ -117,84 +134,26 @@ pub fn download_prebuilt(
     }))
 }
 
-/// Download a file using curl on the host machine.
-fn download_file(url: &str, dest: &str) -> Result<(), Error> {
-    let output = exec(ExecCommandInput {
-        command: "curl".into(),
-        args: vec![
-            "-fSL".into(),
-            "--create-dirs".into(),
-            "-o".into(),
-            dest.into(),
-            url.into(),
-        ],
-        stream: true,
-        ..ExecCommandInput::default()
-    })?;
-
-    if output.exit_code != 0 {
-        return Err(Error::msg(format!(
-            "Failed to download {}: {}",
-            url, output.stderr
-        )));
-    }
-
-    Ok(())
-}
-
 #[plugin_fn]
 pub fn native_install(
     Json(input): Json<NativeInstallInput>,
 ) -> FnResult<Json<NativeInstallOutput>> {
     let env = get_host_environment()?;
-    let install_dir_real = real_path!(input.install_dir.to_string());
+    let install_dir_real = input.install_dir.to_real_path()?.ok_or_else(|| {
+        anyhow!(
+            "Failed to convert install_dir to a real path: {}",
+            input.install_dir
+        )
+    })?;
     let install_dir_str = install_dir_real.to_string_lossy().to_string();
     let version = &input.context.version;
     let version_str = version.to_string();
 
-    // Create a real host temp directory for downloads.
-    // Windows runners don't reliably support `mktemp`, so create a temp dir via PowerShell.
-    let host_temp_dir = match env.os {
-        HostOS::Windows => {
-            let output = exec_captured(
-                "powershell",
-                [
-                    "-NoProfile",
-                    "-Command",
-                    "$dir = Join-Path $env:TEMP ([System.IO.Path]::GetRandomFileName()); New-Item -ItemType Directory -Path $dir -Force | Out-Null; Write-Output $dir",
-                ],
-            )?;
-
-            if output.exit_code != 0 {
-                return Ok(Json(NativeInstallOutput {
-                    installed: false,
-                    error: Some(format!(
-                        "Failed to create temporary directory for AWS CLI installer: {}",
-                        output.stderr
-                    )),
-                    ..NativeInstallOutput::default()
-                }));
-            }
-
-            output.stdout.trim().to_string()
-        }
-        _ => {
-            let output = exec_captured("mktemp", ["-d"])?;
-
-            if output.exit_code != 0 {
-                return Ok(Json(NativeInstallOutput {
-                    installed: false,
-                    error: Some(format!(
-                        "Failed to create temporary directory for AWS CLI installer: {}",
-                        output.stderr
-                    )),
-                    ..NativeInstallOutput::default()
-                }));
-            }
-
-            output.stdout.trim().to_string()
-        }
-    };
+    let temp_dir = &input.context.temp_dir;
+    let temp_dir_real = temp_dir
+        .to_real_path()?
+        .ok_or_else(|| anyhow!("Failed to convert temp_dir to a real path: {}", temp_dir))?;
+    let temp_dir_str = temp_dir_real.to_string_lossy().to_string();
 
     match env.os {
         HostOS::Linux => {
@@ -205,17 +164,17 @@ pub fn native_install(
 
             let zip_name = format!("awscli-exe-linux-{arch}-{version_str}.zip");
             let zip_url = format!("https://awscli.amazonaws.com/{zip_name}");
-            let zip_path = format!("{}/{}", host_temp_dir, zip_name);
+            let zip_virt = VirtualPath::new(temp_dir.join(&zip_name));
+            let zip_path = temp_dir_real.join(&zip_name);
+            let zip_path_str = zip_path.to_string_lossy().to_string();
 
-            // Download the zip archive using curl on the host
             debug!("Downloading AWS CLI from <url>{}</url>", zip_url);
 
-            download_file(&zip_url, &zip_path)?;
+            download_from_url(&zip_url, &zip_virt)?;
 
-            // Unzip the archive
             debug!("Extracting AWS CLI archive");
 
-            let unzip_output = exec_captured("unzip", ["-o", &zip_path, "-d", &host_temp_dir])?;
+            let unzip_output = exec_captured("unzip", ["-o", &zip_path_str, "-d", &temp_dir_str])?;
 
             if unzip_output.exit_code != 0 {
                 return Ok(Json(NativeInstallOutput {
@@ -228,8 +187,7 @@ pub fn native_install(
                 }));
             }
 
-            // Run the installer with --install-dir pointing to proto's install directory
-            let installer_path = format!("{}/aws/install", host_temp_dir);
+            let installer_path = format!("{}/aws/install", temp_dir_str);
             let bin_dir = format!("{}/bin", install_dir_str);
 
             debug!(
@@ -265,20 +223,20 @@ pub fn native_install(
         HostOS::MacOS => {
             let pkg_name = format!("AWSCLIV2-{version_str}.pkg");
             let pkg_url = format!("https://awscli.amazonaws.com/{pkg_name}");
-            let pkg_path = format!("{}/{}", host_temp_dir, pkg_name);
+            let pkg_virt = VirtualPath::new(temp_dir.join(&pkg_name));
+            let pkg_path = temp_dir_real.join(&pkg_name);
+            let pkg_path_str = pkg_path.to_string_lossy().to_string();
 
-            // Download the pkg using curl on the host
             debug!("Downloading AWS CLI from <url>{}</url>", pkg_url);
 
-            download_file(&pkg_url, &pkg_path)?;
+            download_from_url(&pkg_url, &pkg_virt)?;
 
-            // Use pkgutil to expand the pkg, then install to the proto directory
-            let expanded_dir = format!("{}/aws-cli-expanded", host_temp_dir);
+            let expanded_dir = format!("{}/aws-cli-expanded", temp_dir_str);
 
             debug!("Expanding AWS CLI package");
 
             let expand_output =
-                exec_captured("pkgutil", ["--expand-full", &pkg_path, &expanded_dir])?;
+                exec_captured("pkgutil", ["--expand-full", &pkg_path_str, &expanded_dir])?;
 
             if expand_output.exit_code != 0 {
                 return Ok(Json(NativeInstallOutput {
@@ -291,8 +249,6 @@ pub fn native_install(
                 }));
             }
 
-            // The expanded pkg contains aws-cli.pkg/Payload/aws-cli/
-            // Copy the contents to the install directory
             let payload_dir = format!("{}/aws-cli.pkg/Payload/aws-cli", expanded_dir);
 
             debug!(
@@ -323,37 +279,60 @@ pub fn native_install(
         HostOS::Windows => {
             let msi_name = format!("AWSCLIV2-{version_str}.msi");
             let msi_url = format!("https://awscli.amazonaws.com/{msi_name}");
-            let msi_path = format!("{}\\{}", host_temp_dir, msi_name);
+            let msi_virt = VirtualPath::new(temp_dir.join(&msi_name));
+            // Guest `Path::join` under WASI treats Windows host prefixes as a single
+            // component and appends with `/`, which msiexec rejects (error 1619).
+            // Normalize to backslash paths for native Windows tools.
+            let msi_path_str = windows_join(&temp_dir_str, &msi_name);
+            let install_dir_win = windows_host_path(&install_dir_str);
+            let msi_log_path = windows_join(&temp_dir_str, "awscli-msi.log");
 
-            // Download the MSI using curl on the host
             debug!("Downloading AWS CLI from <url>{}</url>", msi_url);
 
-            download_file(&msi_url, &msi_path)?;
+            download_from_url(&msi_url, &msi_virt)?;
 
-            // Install using msiexec with target directory
-            debug!(
-                "Installing AWS CLI to <path>{}</path>",
-                install_dir_str.clone()
-            );
+            // Use administrative extract (`/a`) into proto's install dir instead of
+            // `/i` + INSTALLDIR. The all-users MSI needs elevation and commonly
+            // fails with exit 1603 in CI / non-system install roots.
+            debug!("Extracting AWS CLI MSI to <path>{}</path>", install_dir_win);
 
-            let install_output = exec(ExecCommandInput {
-                command: "msiexec".into(),
-                args: vec![
-                    "/i".into(),
-                    msi_path,
-                    "/qn".into(),
-                    format!("INSTALLDIR={}", install_dir_str.clone()),
+            let install_output = exec_captured(
+                "msiexec",
+                [
+                    "/a",
+                    &msi_path_str,
+                    "/qn",
+                    "/norestart",
+                    &format!("TARGETDIR={install_dir_win}"),
+                    "/L*v",
+                    &msi_log_path,
                 ],
-                stream: true,
-                ..ExecCommandInput::default()
-            })?;
+            )?;
 
             if install_output.exit_code != 0 {
+                let log_tail = exec_captured(
+                    "powershell",
+                    [
+                        "-NoProfile",
+                        "-Command",
+                        &format!(
+                            "if (Test-Path -LiteralPath '{}') {{ Get-Content -LiteralPath '{}' -Tail 40 | Out-String }}",
+                            msi_log_path.replace('\'', "''"),
+                            msi_log_path.replace('\'', "''"),
+                        ),
+                    ],
+                )
+                .map(|output| output.stdout)
+                .unwrap_or_default();
+
                 return Ok(Json(NativeInstallOutput {
                     installed: false,
                     error: Some(format!(
-                        "AWS CLI MSI installation failed: {}",
-                        install_output.stderr
+                        "AWS CLI MSI extraction failed (exit {}): {}\n{}\n{}",
+                        install_output.exit_code,
+                        install_output.stderr,
+                        install_output.stdout,
+                        log_tail
                     )),
                     ..NativeInstallOutput::default()
                 }));
@@ -378,21 +357,12 @@ pub fn native_install(
 pub fn native_uninstall(
     Json(input): Json<NativeUninstallInput>,
 ) -> FnResult<Json<NativeUninstallOutput>> {
-    let env = get_host_environment()?;
-
-    match env.os {
-        HostOS::Windows => {
-            // On Windows, use msiexec to uninstall
-            let _ = exec_captured("msiexec", ["/x", "AWSCLIV2", "/qn"]);
-        }
-        _ => {
-            // On Linux/macOS, proto handles directory removal
-            debug!(
-                "Removing AWS CLI from <path>{}</path>",
-                input.uninstall_dir.to_string()
-            );
-        }
-    }
+    // Proto removes the install directory. Windows uses MSI extract (`/a`), so
+    // there is no registered product to uninstall via `msiexec /x`.
+    debug!(
+        "Removing AWS CLI from <path>{}</path>",
+        input.uninstall_dir.to_string()
+    );
 
     Ok(Json(NativeUninstallOutput {
         uninstalled: true,
@@ -409,10 +379,10 @@ pub fn locate_executables(
     let (exe_path, completer_path) = match env.os {
         HostOS::Linux => ("bin/aws".to_string(), "bin/aws_completer".to_string()),
         HostOS::MacOS => ("aws".to_string(), "aws_completer".to_string()),
-        // AWS CLI MSI installs under v2/current/bin on Windows.
+        // `msiexec /a` extracts under Amazon/AWSCLIV2 on Windows.
         HostOS::Windows => (
-            "v2/current/bin/aws.exe".to_string(),
-            "v2/current/bin/aws_completer.exe".to_string(),
+            "Amazon/AWSCLIV2/aws.exe".to_string(),
+            "Amazon/AWSCLIV2/aws_completer.exe".to_string(),
         ),
         _ => ("aws".to_string(), "aws_completer".to_string()),
     };

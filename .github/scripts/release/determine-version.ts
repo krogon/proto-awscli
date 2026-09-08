@@ -10,6 +10,14 @@ async function run(cmd: string[]): Promise<string> {
   return decoder.decode(stdout).trim();
 }
 
+function isReleaseOnlyCommit(msg: string): boolean {
+  return (
+    msg.startsWith("chore(release):") ||
+    msg.startsWith("release:") ||
+    /^Merge pull request #\d+ from .+\/release\//.test(msg)
+  );
+}
+
 async function main() {
   const latestTag = await run(["git", "describe", "--tags", "--abbrev=0"]).catch(() => "");
 
@@ -20,7 +28,13 @@ async function main() {
     Deno.exit(0);
   }
 
-  const commits = log.split("\n");
+  // Ignore release automation commits so merging a release PR (and the
+  // Auto Release run it triggers on master) does not open another release PR.
+  const commits = log.split("\n").filter((msg) => !isReleaseOnlyCommit(msg));
+  if (commits.length === 0) {
+    Deno.exit(0);
+  }
+
   let bump: "major" | "minor" | "patch" = "patch";
 
   for (const msg of commits) {
@@ -62,6 +76,10 @@ async function main() {
   const date = new Date().toISOString().slice(0, 10).replace(/-/g, "");
   const version = `${major}.${minor}.${patch}-alpha.${date}.${runNumber}`;
 
+  const out = Deno.env.get("GITHUB_OUTPUT");
+  if (out) {
+    await Deno.writeTextFile(out, `version=${version}\n`, { append: true });
+  }
   console.log(version);
 }
 

@@ -15,6 +15,14 @@ permissions:
 
 jobs:
   create-release-pr:
+    # Merging release/* already publishes the alpha via On Release Merge.
+    # Skip Auto Release on that same master push so it cannot open another PR.
+    if: >-
+      ${{
+        !startsWith(github.event.head_commit.message, 'chore(release):') &&
+        !startsWith(github.event.head_commit.message, 'release:') &&
+        !contains(github.event.head_commit.message, '/release/')
+      }}
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -27,7 +35,7 @@ jobs:
           deno-version: v2.x
 
       - id: version
-        run: deno run --allow-run --allow-read --allow-env .github/scripts/release/determine-version.ts
+        run: deno run --allow-run --allow-read --allow-env --allow-write=$GITHUB_OUTPUT .github/scripts/release/determine-version.ts
 
       - if: steps.version.outputs.version != ''
         run: sed -i "s/^version = \".*\"/version = \"${{ steps.version.outputs.version }}\"/" Cargo.toml

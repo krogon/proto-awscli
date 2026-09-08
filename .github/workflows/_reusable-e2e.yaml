@@ -28,6 +28,14 @@ jobs:
           name: proto_awscli.wasm
           path: .
 
+      - name: Pin proto version
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const { writeFileSync } = require('node:fs');
+            const { join } = require('node:path');
+            writeFileSync(join(process.env.GITHUB_WORKSPACE, '.prototools'), 'proto = "0.62.0"\n');
+
       - uses: moonrepo/setup-toolchain@261c62cb5b0f580c7be7c8cd0f023a2e96756095 # v0.6.4
         with:
           auto-install: true
@@ -45,6 +53,7 @@ jobs:
 
             const prototoolsPath = join(process.env.GITHUB_WORKSPACE, '.prototools');
             const content = [
+              'proto = "0.62.0"',
               'awscli = "2.34.59"',
               '[plugins.tools]',
               `awscli = "${pluginUri}"`,
