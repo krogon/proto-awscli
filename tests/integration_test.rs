@@ -10,8 +10,16 @@ fn ensure_wasm_built() {
         let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
 
         let output = Command::new("cargo")
-            .arg("+1.91.0")
-            .args(["build", "--target", "wasm32-wasip1", "--release", "--quiet"])
+            .args([
+                "build",
+                "--target",
+                "wasm32-wasip1",
+                "--release",
+                "--features",
+                "wasm",
+                "--quiet",
+            ])
+            .env("CARGO_TARGET_DIR", manifest_dir.join("target"))
             .current_dir(manifest_dir)
             .output()
             .map_err(|error| format!("Failed to run cargo build for wasm target: {error}"))?;
@@ -304,7 +312,7 @@ mod awscli_tool {
             .await;
 
         let aws_exe = output.exes.get("aws").unwrap();
-        assert_eq!(aws_exe.exe_path, Some("v2/current/bin/aws.exe".into()));
+        assert_eq!(aws_exe.exe_path, Some("Amazon/AWSCLIV2/aws.exe".into()));
         assert!(aws_exe.primary);
     }
 }
