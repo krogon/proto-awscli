@@ -18,11 +18,13 @@ crate-type = ["cdylib"]
 [dependencies]
 extism-pdk = "1.4.1"
 proto_pdk = "0.32.8"
+system_env = "=0.10.1"
 
 [dev-dependencies]
 proto_pdk_test_utils = "0.45.1"
 starbase_sandbox = "0.8.2"
 tokio = { version = "1", features = ["full"] }
+http-cache-reqwest = "=1.0.0-alpha.6"
 
 [profile.release]
 opt-level = "s"
